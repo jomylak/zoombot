@@ -32,13 +32,19 @@ CHROMIUM_ARGS = [
 SEL_NAME_INPUT = ["#input-for-name", "input[placeholder*='name' i]", "#inputname"]
 SEL_PASSCODE = ["#input-for-pwd", "input[type='password']"]
 SEL_JOIN_BTN = ["button:has-text('Join')", "#joinBtn", ".preview-join-button"]
-SEL_IN_MEETING = ["#foot-bar", ".footer-button__participants-icon",
-                  "[aria-label*='Participants' i]", ".meeting-info-icon"]
+SEL_JOIN_FROM_BROWSER = ["button:has-text('Join from browser')",
+                         ":text('Join from browser')"]
+SEL_CONTINUE_WITHOUT_MEDIA = ["button:has-text('Continue without microphone and camera')",
+                              "button:has-text('Continue without')"]
+SEL_IN_MEETING = ["#foot-bar", ".footer-participants-button",
+                  "[aria-label*='open the participants' i]", ".meeting-info-icon"]
 SEL_WAITING_ROOM = [":text('Please wait')", ":text('waiting room')",
-                    ":text('host will let you in')"]
+                    ":text('host will let you in')",
+                    ":text('Host has joined')",
+                    ":text('We've let them know')"]
 SEL_LEAVE_BTN = ["button:has-text('Leave')", ".footer__leave-btn"]
 SEL_LOGIN_WALL = ["input[type='password'][name='password']", ":text('Sign In to Join')"]
-SEL_PARTICIPANT_COUNT = [".footer-button__number-counter span",
+SEL_PARTICIPANT_COUNT = [".footer-button__number-counter",
                          "[aria-label*='open the participants' i] span"]
 
 
@@ -126,6 +132,25 @@ def run(event_id: str) -> int:
                     "Zoom is asking us to sign in -- saved session expired. "
                     "Re-run: python -m bot.zoom_login")
 
+            # Registration links land on an intermediate "which app" chooser
+            # before the actual join screen -- direct /wc/ links skip this.
+            chooser = _first(page, SEL_JOIN_FROM_BROWSER, timeout=5_000)
+            if chooser:
+                log.info("hit the app-vs-browser chooser, clicking 'Join from browser'")
+                chooser.click()
+                page.wait_for_timeout(2_000)
+
+            # Zoom sometimes shows up to two device-permission prompts
+            # ("see you" then "hear you") before the name field is usable.
+            # Dismiss without granting -- the bot doesn't need mic/camera.
+            for _ in range(2):
+                dismiss = _first(page, SEL_CONTINUE_WITHOUT_MEDIA, timeout=3_000)
+                if not dismiss:
+                    break
+                log.info("dismissing a device-permission prompt")
+                dismiss.click()
+                page.wait_for_timeout(1_000)
+
             el = _first(page, SEL_NAME_INPUT, timeout=15_000)
             if el:
                 el.fill(config.ZOOM_DISPLAY_NAME)
@@ -161,12 +186,24 @@ def run(event_id: str) -> int:
 
             exit_reason = "scheduled_end"
             low_streak = 0
+            near_end_shot_taken = False
+            NEAR_END_WINDOW = dt.timedelta(minutes=5)
+
             while dt.datetime.now(dt.timezone.utc) < deadline:
                 page.wait_for_timeout(30_000)
 
                 if not _visible(page, SEL_IN_MEETING):
                     exit_reason = "host_ended_or_dropped"
                     break
+
+                # One shot ~5 min before scheduled end, only while still
+                # genuinely in the meeting -- if it already ended, the
+                # break above already exited the loop before this runs.
+                if (not near_end_shot_taken
+                        and deadline - dt.datetime.now(dt.timezone.utc) <= NEAR_END_WINDOW):
+                    _shot(page, event_id, "near_end")
+                    near_end_shot_taken = True
+                    log.info("near-end screenshot taken for %s", subject)
 
                 n = _participant_count(page)
                 if n is not None and n < config.MIN_PARTICIPANTS:
