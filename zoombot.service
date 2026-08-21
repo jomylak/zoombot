@@ -1,0 +1,17 @@
+[Unit]
+Description=Zoom auto-join attendance bot
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/zoombot
+ExecStart=%h/zoombot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+# Keep a runaway Chromium from taking the whole Pi down
+MemoryMax=2500M
+
+[Install]
+WantedBy=default.target
