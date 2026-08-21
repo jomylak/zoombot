@@ -9,7 +9,7 @@ log = logging.getLogger(__name__)
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 # Personal Microsoft accounts (outlook.com / hotmail) live under /consumers.
-AUTHORITY = "https://login.microsoftonline.com/consumers"
+AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Calendars.Read", "Mail.Read"]
 
 
