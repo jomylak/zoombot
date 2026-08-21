@@ -5,7 +5,7 @@ import logging
 import subprocess
 import datetime as dt
 
-from . import config, db, graph, extract, notify
+from . import config, db, ics_calendar, extract, notify
 
 log = logging.getLogger("main")
 _running = True
@@ -18,14 +18,8 @@ def _stop(*_):
     log.info("shutting down...")
 
 
-def _iso(v):
-    """Graph hands back naive UTC strings; make them tz-aware."""
-    d = dt.datetime.fromisoformat(v["dateTime"].split(".")[0])
-    return d.replace(tzinfo=dt.timezone.utc).isoformat()
-
-
-def poll(token):
-    events = graph.upcoming_events(token, config.LOOKAHEAD_MINUTES)
+def poll():
+    events = ics_calendar.upcoming_events(config.LOOKAHEAD_MINUTES)
     log.info("%d tagged event(s) in the next %dm", len(events), config.LOOKAHEAD_MINUTES)
 
     for ev in events:
@@ -34,34 +28,27 @@ def poll(token):
             continue  # already tracked
 
         parsed = extract.parse_event(
-            ev.get("subject", ""),
-            (ev.get("body") or {}).get("content", ""),
-            (ev.get("location") or {}).get("displayName", ""))
+            ev.get("subject", ""), ev.get("body", ""), ev.get("location", ""))
 
         if not parsed:
             log.warning("no Zoom details in %r -- skipping", ev.get("subject"))
             db.upsert_scheduled({
                 "event_id": eid, "subject": ev.get("subject"),
-                "organizer": (ev.get("organizer") or {}).get("emailAddress", {}).get("address"),
-                "scheduled_start": _iso(ev["start"]), "scheduled_end": _iso(ev["end"]),
+                "organizer": ev.get("organizer"),
+                "scheduled_start": ev["start"].isoformat(), "scheduled_end": ev["end"].isoformat(),
                 "join_url": None, "passcode": None, "link_source": "none"})
             db.set_status(eid, "skipped", error="no zoom link found")
             notify.push("No Zoom link", ev.get("subject", ""), priority="high")
             continue
 
-        # Prefer a per-registrant link from the confirmation email.
-        url, source = parsed["join_url"], "calendar"
-        reg = graph.find_registration_link(token, parsed["meeting_id"])
-        if reg:
-            url, source = reg, "registration"
-        url = extract.web_client_url(parsed["meeting_id"], parsed["passcode"], url)
+        url = extract.web_client_url(parsed["meeting_id"], parsed["passcode"], parsed["join_url"])
 
         db.upsert_scheduled({
             "event_id": eid, "subject": ev.get("subject"),
-            "organizer": (ev.get("organizer") or {}).get("emailAddress", {}).get("address"),
-            "scheduled_start": _iso(ev["start"]), "scheduled_end": _iso(ev["end"]),
-            "join_url": url, "passcode": parsed["passcode"], "link_source": source})
-        log.info("queued %r (%s link)", ev.get("subject"), source)
+            "organizer": ev.get("organizer"),
+            "scheduled_start": ev["start"].isoformat(), "scheduled_end": ev["end"].isoformat(),
+            "join_url": url, "passcode": parsed["passcode"], "link_source": "calendar"})
+        log.info("queued %r", ev.get("subject"))
 
 
 def launch_due():
@@ -102,7 +89,7 @@ def main():
     while _running:
         try:
             if time.time() - last_poll > config.POLL_INTERVAL_MINUTES * 60:
-                poll(graph.get_token())
+                poll()
                 last_poll = time.time()
             launch_due()
             reap()

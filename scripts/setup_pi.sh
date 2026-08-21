@@ -30,7 +30,6 @@ sudo loginctl enable-linger "$USER"
 
 echo
 echo "Next:"
-echo "  1. cp .env.example .env  &&  edit it"
-echo "  2. ./.venv/bin/python -m bot.graph login       # Microsoft device code"
-echo "  3. ./.venv/bin/python -m bot.zoom_login        # needs a screen, once"
-echo "  4. ./.venv/bin/python -m bot.graph             # verify tagged events show up"
+echo "  1. cp .env.example .env  &&  edit it (set ICS_URL)"
+echo "  2. ./.venv/bin/python -m bot.zoom_login        # needs a screen, once"
+echo "  3. ./.venv/bin/python -m bot.ics_calendar      # verify tagged events show up"

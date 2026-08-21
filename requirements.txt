@@ -1,7 +1,7 @@
-msal==1.31.0
 requests==2.32.3
+icalendar==6.1.0
+python-dateutil==2.9.0.post0
 playwright>=1.49
 greenlet>=3.1.0
 python-dotenv==1.0.1
 beautifulsoup4==4.12.3
- 

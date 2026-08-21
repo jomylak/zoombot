@@ -4,24 +4,25 @@ Joins Zoom meetings tagged in your Outlook calendar, sits in them, leaves, and
 logs what happened. Built for a Raspberry Pi 4 (64-bit, 4GB+).
 
 ```
-Outlook (Graph)  ->  filter by category  ->  extract Zoom link
-                                              |
-                        prefer per-registrant tk= link from your inbox
-                                              |
-                     headless Chromium joins  ->  SQLite log + ntfy push
+Outlook (published ICS feed)  ->  filter by [AutoJoin] in the title  ->  extract Zoom link
+                                                                          |
+                                          headless Chromium joins  ->  SQLite log + ntfy push
 ```
 
-## 1. Register a Microsoft app (5 min, one time)
+## 1. Publish your calendar (2 min, one time)
 
-1. <https://portal.azure.com> -> **Microsoft Entra ID** -> **App registrations** -> **New registration**
-2. Name it anything. Under supported account types choose
-   **"Personal Microsoft accounts only"**.
-3. Leave the redirect URI blank. Register.
-4. **Authentication** -> **Allow public client flows: Yes**. Save.
-   (Device-code auth fails with an obscure error without this.)
-5. **API permissions** -> Add -> Microsoft Graph -> **Delegated** ->
-   `Calendars.Read`, `Mail.Read`. No admin consent needed on a personal account.
-6. Copy the **Application (client) ID** into `.env` as `MS_CLIENT_ID`.
+1. In Outlook on the web: **Settings** -> **Calendar** -> **Shared calendars**.
+2. Under **Publish a calendar**, pick the calendar you want (usually your
+   main one) and permission **Can view all details**.
+3. Click **Publish**, then copy the **ICS** link it gives you.
+4. Paste it into `.env` as `ICS_URL`.
+
+> **This link is a bearer secret, not a login.** Anyone who has the URL can
+> read your entire calendar -- title, body, attendees, everything -- with no
+> further authentication. Don't commit it, don't paste it into chat, don't
+> put it in a public gist. If it ever leaks, go back to **Shared calendars**
+> and use **Reset** next to the published link to invalidate it and generate
+> a new one.
 
 ## 2. Install on the Pi
 
@@ -34,10 +35,9 @@ cp .env.example .env && nano .env
 `ZOOM_DISPLAY_NAME` must match your Zoom account name exactly — it's what a
 host's attendance report matches against.
 
-## 3. Authenticate
+## 3. Authenticate to Zoom
 
 ```bash
-./.venv/bin/python -m bot.graph login    # prints a code, open the URL anywhere
 ./.venv/bin/python -m bot.zoom_login     # needs a screen -- see note below
 ```
 
@@ -46,16 +46,22 @@ on your laptop and copy `~/.zoombot/zoom_state.json` over, or install
 `realvnc-vnc-server` and do it over VNC. Cookies last weeks; when they expire
 the bot detects the login wall, fails loudly, and pushes you a notification.
 
+There's no separate Microsoft/Outlook auth step -- the ICS feed is fetched by
+plain HTTP GET, no login or token involved.
+
 ## 4. Tag a meeting
 
-In Outlook, right-click the event -> **Categorize** -> create/apply a category
-named to match `AUTOJOIN_CATEGORY` (default `AutoJoin`). You apply this
-yourself; it doesn't depend on the organizer.
+Put the literal tag `AUTOJOIN_SUBJECT_TAG` (default `[AutoJoin]`) directly in
+the meeting's **title** in Outlook, e.g. `Weekly sync [AutoJoin]`. This
+replaces the old category-based tagging -- published ICS feeds generally
+don't carry Outlook categories, so filtering is now a substring match against
+the event subject. You apply this yourself; it doesn't depend on the
+organizer.
 
 Verify it's visible:
 
 ```bash
-./.venv/bin/python -m bot.graph
+./.venv/bin/python -m bot.ics_calendar
 ```
 
 ## 5. Run it
@@ -92,7 +98,18 @@ shot shows exactly what the page looked like. The selector lists at the top of
 - **Home internet is the single point of failure.** Verify the ntfy alerts
   actually reach your phone before trusting this, and spot-check early
   sessions yourself — a bot that fails silently is worse than no bot.
-- Recurring events are treated as independent occurrences (Graph's
-  `calendarView` expands them), so each instance is tracked separately.
+- **Registration-required meetings are a real gap.** There's no mail search
+  anymore (no Graph, no `Mail.Read`), so the bot can't go fetch your
+  per-registrant `tk=` confirmation link. It only ever uses whatever join
+  link is sitting in the calendar invite body. That's usually the plain,
+  non-personalized link, which commonly still works -- but if an organizer
+  requires registration and only puts the personalized link in a
+  confirmation *email* rather than the invite itself, the bot has nothing to
+  join with and will skip the meeting as "no zoom link found."
+- Recurring events are expanded client-side from each series' `RRULE` (the
+  published ICS feed typically carries one `VEVENT` per series, not one per
+  occurrence, unlike Graph's `calendarView`). Exception/override instances
+  (`RECURRENCE-ID`) and `EXDATE` are honored; more exotic recurrence edge
+  cases haven't been battle-tested.
 - If an event moves after the bot queued it, the row is updated on the next
   poll only while its status is still `scheduled`.
