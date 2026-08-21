@@ -1,4 +1,5 @@
 """Scheduler loop: poll Outlook, resolve links, spawn a joiner per meeting."""
+import sys
 import time
 import signal
 import logging
@@ -63,8 +64,9 @@ def launch_due():
         if now < start - dt.timedelta(minutes=config.JOIN_LEAD_MINUTES):
             continue
         log.info("launching joiner for %r", rec["subject"])
+        notify.push("Launching", rec["subject"])
         proc = subprocess.Popen(
-            ["python3", "-m", "bot.joiner", rec["event_id"]],
+            [sys.executable, "-m", "bot.joiner", rec["event_id"]],
             cwd=str(config.Path(__file__).resolve().parent.parent))
         _children[rec["event_id"]] = proc
 
@@ -73,6 +75,11 @@ def reap():
     for eid, proc in list(_children.items()):
         if proc.poll() is not None:
             log.info("joiner for %s exited rc=%s", eid, proc.returncode)
+            if proc.returncode != 0:
+                rec = db.get(eid)
+                if rec and rec["status"] == "scheduled":
+                    db.set_status(eid, "failed", error=f"joiner crashed (exit {proc.returncode})")
+                    notify.push("Joiner crashed", rec["subject"], priority="high")
             del _children[eid]
 
 
