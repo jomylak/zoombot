@@ -81,8 +81,16 @@ def upcoming_events(lookahead_minutes: int):
             if organizer else None
 
         uid = str(comp.get("UID", ""))
-        body = str(comp.get("DESCRIPTION", ""))
-        location = str(comp.get("LOCATION", ""))
+
+        # Different hosts put the join link in different fields (DESCRIPTION,
+        # LOCATION, even COMMENT) -- concatenate everything so extract.parse_event()
+        # finds it regardless of where it landed.
+        blob_parts = [subject]
+        for field in ("DESCRIPTION", "LOCATION", "COMMENT"):
+            val = comp.get(field)
+            if val:
+                blob_parts.append(str(val))
+        blob = " ".join(blob_parts)
 
         for start in _occurrences(comp, now, end):
             finish = start + duration if duration is not None else start
@@ -92,8 +100,7 @@ def upcoming_events(lookahead_minutes: int):
                 "organizer": organizer_addr,
                 "start": start,
                 "end": finish,
-                "body": body,
-                "location": location,
+                "body": blob,
             })
 
     out.sort(key=lambda e: e["start"])

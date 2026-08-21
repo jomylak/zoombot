@@ -27,8 +27,7 @@ def poll():
         if db.get(eid):
             continue  # already tracked
 
-        parsed = extract.parse_event(
-            ev.get("subject", ""), ev.get("body", ""), ev.get("location", ""))
+        parsed = extract.parse_event(ev.get("subject", ""), ev.get("body", ""), "")
 
         if not parsed:
             log.warning("no Zoom details in %r -- skipping", ev.get("subject"))
