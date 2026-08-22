@@ -10,6 +10,7 @@ import time
 import logging
 import datetime as dt
 import shutil
+import subprocess
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -29,9 +30,12 @@ CHROMIUM_ARGS = [
 # Zoom rewrites its web client fairly often. Each of these is a list of
 # candidates tried in order -- when a join breaks, this is the first place
 # to look. Grab a screenshot from ~/.zoombot/screenshots to see what changed.
-SEL_NAME_INPUT = ["#input-for-name", "input[placeholder*='name' i]", "#inputname"]
-SEL_PASSCODE = ["#input-for-pwd", "input[type='password']"]
-SEL_JOIN_BTN = ["button:has-text('Join')", "#joinBtn", ".preview-join-button"]
+SEL_NAME_INPUT = ["#input-for-name", "input[placeholder*='name' i]", "#inputname",
+                  "input[type='text']"]
+SEL_PASSCODE = ["#input-for-pwd", "input[type='password']",
+                "input[aria-label*='passcode' i]", "input[aria-label*='password' i]"]
+SEL_JOIN_BTN = ["button:has-text('Join')", "#joinBtn", ".preview-join-button",
+               "text=Join"]
 SEL_JOIN_FROM_BROWSER = ["button:has-text('Join from browser')",
                          ":text('Join from browser')"]
 SEL_CONTINUE_WITHOUT_MEDIA = ["button:has-text('Continue without microphone and camera')",
@@ -58,6 +62,28 @@ def _first(page, selectors, timeout=3000):
         except PWTimeout:
             continue
     return None
+
+
+def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=1500):
+    """Keep re-scanning the whole selector list every few seconds until one
+    resolves or timeout_s elapses -- a single _first() pass gives up for good
+    once it's cycled through the list, even if the field just hadn't rendered
+    yet. Also rides through transient errors (mid re-render, brief overlay)
+    that would otherwise abort a one-shot wait_for_selector call."""
+    deadline = time.time() + timeout_s
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            el = _first(page, selectors, timeout=per_try_timeout)
+        except Exception as e:
+            log.debug("retry attempt %d: transient error %s", attempt, e)
+            el = None
+        if el:
+            return el
+        if time.time() >= deadline:
+            return None
+        page.wait_for_timeout(poll_s * 1000)
 
 
 def _visible(page, selectors) -> bool:
@@ -98,11 +124,42 @@ def _participant_count(page):
     return None
 
 
+def _ensure_audio():
+    """PulseAudio is socket-activated on this Pi and has been observed
+    sitting dead or with its null-sink suspended between runs -- both
+    states can trigger Zoom's 'browser is preventing access to your
+    microphone' warning, which silently stalls the join. Force it into a
+    known-good state before every attempt rather than trusting whatever
+    was left over from a prior run."""
+    try:
+        subprocess.run(["systemctl", "--user", "restart", "pulseaudio.service"],
+                       capture_output=True, timeout=10)
+        time.sleep(2)
+        result = subprocess.run(["pactl", "list", "short", "sinks"],
+                                capture_output=True, text=True, timeout=5)
+        if "virtual" not in result.stdout and "auto_null" not in result.stdout:
+            subprocess.run(["pactl", "load-module", "module-null-sink",
+                           "sink_name=virtual"], capture_output=True, timeout=5)
+            subprocess.run(["pactl", "load-module", "module-null-source",
+                           "source_name=virtmic"], capture_output=True, timeout=5)
+        sink_name = "virtual" if "virtual" in result.stdout else "auto_null"
+        # A SUSPENDED sink can still trip getUserMedia checks -- resume it.
+        subprocess.run(["pactl", "set-default-sink", sink_name],
+                       capture_output=True, timeout=5)
+        subprocess.run(["pactl", "suspend-sink", sink_name, "0"],
+                       capture_output=True, timeout=5)
+        log.info("audio sink verified before join attempt")
+    except Exception as e:
+        log.warning("audio sink check failed (continuing anyway): %s", e)
+
+
 def run(event_id: str) -> int:
     rec = db.get(event_id)
     if not rec:
         log.error("no such event %s", event_id)
         return 2
+
+    _ensure_audio()
 
     subject = rec["subject"]
     url = rec["join_url"]
@@ -151,7 +208,10 @@ def run(event_id: str) -> int:
                 dismiss.click()
                 page.wait_for_timeout(1_000)
 
-            el = _first(page, SEL_NAME_INPUT, timeout=30_000)
+            # Retry (not one-shot) -- the page can be slow to render on this
+            # hardware, and a single timed check can miss an element that
+            # shows up a few seconds later.
+            el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=45)
             if el:
                 el.fill(config.ZOOM_DISPLAY_NAME)
             else:
@@ -161,13 +221,16 @@ def run(event_id: str) -> int:
                     "on this hardware, or the pre-join screen changed")
 
             if rec["link_source"] != "registration":
-                pw_el = _first(page, SEL_PASSCODE, timeout=3_000)
+                pw_el = _retry_for_any(page, SEL_PASSCODE, timeout_s=10)
                 if pw_el and rec.get("passcode"):
                     pw_el.fill(rec["passcode"])
 
-            btn = _first(page, SEL_JOIN_BTN, timeout=10_000)
+            btn = _retry_for_any(page, SEL_JOIN_BTN, timeout_s=20)
             if btn:
                 btn.click()
+            else:
+                _shot(page, event_id, "no_join_button")
+                raise RuntimeError("Join button never appeared or never became clickable")
 
             # Wait to actually land in the meeting -- may sit in a waiting room.
             join_deadline = time.time() + config.JOIN_TIMEOUT_MINUTES * 60
