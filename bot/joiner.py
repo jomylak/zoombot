@@ -29,12 +29,9 @@ CHROMIUM_ARGS = [
 # Zoom rewrites its web client fairly often. Each of these is a list of
 # candidates tried in order -- when a join breaks, this is the first place
 # to look. Grab a screenshot from ~/.zoombot/screenshots to see what changed.
-SEL_NAME_INPUT = ["#input-for-name", "input[placeholder*='name' i]", "#inputname",
-                  "input[type='text']"]
-SEL_PASSCODE = ["#input-for-pwd", "input[type='password']",
-                "input[aria-label*='passcode' i]", "input[aria-label*='password' i]"]
-SEL_JOIN_BTN = ["button:has-text('Join')", "#joinBtn", ".preview-join-button",
-               "text=Join"]
+SEL_NAME_INPUT = ["#input-for-name", "input[placeholder*='name' i]", "#inputname"]
+SEL_PASSCODE = ["#input-for-pwd", "input[type='password']"]
+SEL_JOIN_BTN = ["button:has-text('Join')", "#joinBtn", ".preview-join-button"]
 SEL_JOIN_FROM_BROWSER = ["button:has-text('Join from browser')",
                          ":text('Join from browser')"]
 SEL_CONTINUE_WITHOUT_MEDIA = ["button:has-text('Continue without microphone and camera')",
@@ -61,25 +58,6 @@ def _first(page, selectors, timeout=3000):
         except PWTimeout:
             continue
     return None
-
-
-def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=1500):
-    """Keep re-scanning the whole selector list every few seconds until one
-    resolves or timeout_s elapses -- a single _first() pass gives up for good
-    once it's cycled through the list, even if the field just hadn't rendered
-    yet. Also rides through transient errors (mid re-render, brief overlay)
-    that would otherwise abort a one-shot wait_for_selector call."""
-    deadline = time.time() + timeout_s
-    while True:
-        try:
-            el = _first(page, selectors, timeout=per_try_timeout)
-        except Exception:
-            el = None
-        if el:
-            return el
-        if time.time() >= deadline:
-            return None
-        page.wait_for_timeout(poll_s * 1000)
 
 
 def _visible(page, selectors) -> bool:
@@ -173,16 +151,21 @@ def run(event_id: str) -> int:
                 dismiss.click()
                 page.wait_for_timeout(1_000)
 
-            el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=30)
+            el = _first(page, SEL_NAME_INPUT, timeout=30_000)
             if el:
                 el.fill(config.ZOOM_DISPLAY_NAME)
+            else:
+                _shot(page, event_id, "no_name_field")
+                raise RuntimeError(
+                    "name input never appeared -- page may be slow to load "
+                    "on this hardware, or the pre-join screen changed")
 
             if rec["link_source"] != "registration":
-                pw_el = _retry_for_any(page, SEL_PASSCODE, timeout_s=10)
+                pw_el = _first(page, SEL_PASSCODE, timeout=3_000)
                 if pw_el and rec.get("passcode"):
                     pw_el.fill(rec["passcode"])
 
-            btn = _retry_for_any(page, SEL_JOIN_BTN, timeout_s=20)
+            btn = _first(page, SEL_JOIN_BTN, timeout=10_000)
             if btn:
                 btn.click()
 
