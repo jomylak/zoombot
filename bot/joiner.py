@@ -64,7 +64,7 @@ def _first(page, selectors, timeout=3000):
     return None
 
 
-def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=1500):
+def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=3000):
     """Keep re-scanning the whole selector list every few seconds until one
     resolves or timeout_s elapses -- a single _first() pass gives up for good
     once it's cycled through the list, even if the field just hadn't rendered
@@ -77,12 +77,14 @@ def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=1500):
         try:
             el = _first(page, selectors, timeout=per_try_timeout)
         except Exception as e:
-            log.debug("retry attempt %d: transient error %s", attempt, e)
+            log.info("retry attempt %d: transient error %s", attempt, e)
             el = None
         if el:
             return el
         if time.time() >= deadline:
             return None
+        log.info("retry attempt %d: none of %s found yet, retrying in %ds",
+                 attempt, selectors, poll_s)
         page.wait_for_timeout(poll_s * 1000)
 
 
@@ -108,9 +110,13 @@ def _shot(page, event_id, tag):
     try:
         p = config.SHOTS_DIR / f"{event_id[:24]}_{tag}_{int(time.time())}.png"
         page.screenshot(path=str(p))
+        _shot.last_taken = time.time()
         return p
     except Exception:
         return None
+
+
+_shot.last_taken = 0
 
 
 def _participant_count(page):
@@ -178,6 +184,8 @@ def run(event_id: str) -> int:
             permissions=["microphone", "camera"],
         )
         page = ctx.new_page()
+        page.on("console", lambda msg: log.info("browser console: %s", msg.text))
+        page.on("pageerror", lambda exc: log.error("browser page error: %s", exc))
         try:
             log.info("navigating: %s", url)
             page.goto(url, timeout=90_000, wait_until="domcontentloaded")
@@ -211,6 +219,8 @@ def run(event_id: str) -> int:
             # Retry (not one-shot) -- the page can be slow to render on this
             # hardware, and a single timed check can miss an element that
             # shows up a few seconds later.
+            log.info("page title at name-check: %s", page.title())
+            log.info("page URL at name-check: %s", page.url)
             el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=45)
             if el:
                 el.fill(config.ZOOM_DISPLAY_NAME)
@@ -303,7 +313,11 @@ def run(event_id: str) -> int:
 
         except Exception as e:
             log.exception("join failed")
-            _shot(page, event_id, "error")
+            # A specific failure point above (loginwall / no_name_field /
+            # no_join_button / jointimeout) already grabbed its own shot --
+            # don't also fire this generic one for the same failure.
+            if time.time() - _shot.last_taken > 5:
+                _shot(page, event_id, "error")
             db.set_status(event_id, "failed", error=str(e)[:500])
             notify.push("JOIN FAILED", f"{subject}\n{e}", priority="high", tags="rotating_light")
             return 1
