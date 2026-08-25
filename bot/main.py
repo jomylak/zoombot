@@ -6,7 +6,7 @@ import logging
 import subprocess
 import datetime as dt
 
-from . import config, db, ics_calendar, extract, notify
+from . import config, db, ics_calendar, extract, notify, check_session
 
 log = logging.getLogger("main")
 _running = True
@@ -92,11 +92,15 @@ def main():
     notify.push("zoombot", "scheduler started")
 
     last_poll = 0
+    last_session_check = 0
     while _running:
         try:
             if time.time() - last_poll > config.POLL_INTERVAL_MINUTES * 60:
                 poll()
                 last_poll = time.time()
+            if time.time() - last_session_check > config.SESSION_CHECK_INTERVAL_HOURS * 3600:
+                check_session.check()
+                last_session_check = time.time()
             launch_due()
             reap()
         except Exception as e:

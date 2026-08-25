@@ -13,8 +13,16 @@ from . import config
 
 def main():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, channel=None,
-                                    executable_path=_chromium_path())
+        browser = p.chromium.launch(
+            headless=False, channel=None,
+            executable_path=_chromium_path(),
+            # Google's OAuth login blocks sign-in ("This browser or app may
+            # not be secure") when it detects navigator.webdriver / the
+            # automation banner -- both are standard Playwright/CDP tells.
+            # Suppressing them here is what actually gets us past that wall.
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
         ctx = browser.new_context()
         page = ctx.new_page()
         page.goto("https://zoom.us/signin", timeout=60_000)

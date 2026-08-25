@@ -12,7 +12,7 @@ import datetime as dt
 import shutil
 import subprocess
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 from . import config, db, notify
 
@@ -20,7 +20,7 @@ log = logging.getLogger("joiner")
 
 CHROMIUM_ARGS = [
     "--use-fake-ui-for-media-stream",      # auto-accept mic/cam prompts
-    "--use-fake-device-for-video-capture",  # synthetic camera, no hardware
+    "--use-fake-device-for-media-stream",  # synthetic camera + mic, no real hardware needed
     "--autoplay-policy=no-user-gesture-required",
     "--disable-dev-shm-usage",              # /dev/shm is tiny on the Pi
     "--disable-features=IsolateOrigins,site-per-process",
@@ -52,15 +52,26 @@ SEL_PARTICIPANT_COUNT = [".footer-button__number-counter",
                          "[aria-label*='open the participants' i] span"]
 
 
+def _content_frames(page):
+    """The pre-join and in-meeting UI render inside a nested iframe whose URL
+    carries per-session join tokens (wpk=, _x_zm_rtaid=, ...) -- never the
+    top-level document. page.locator()/wait_for_selector() only search the
+    main frame, so every lookup has to walk all frames instead. Skip
+    reCAPTCHA and blank placeholder frames; they never hold anything we want
+    and just slow every check down."""
+    return [f for f in page.frames if "recaptcha" not in f.url and f.url != "about:blank"]
+
+
 def _first(page, selectors, timeout=3000):
-    """Return the first selector that resolves, else None."""
-    for sel in selectors:
-        try:
-            el = page.wait_for_selector(sel, timeout=timeout, state="visible")
-            if el:
-                return el
-        except PWTimeout:
-            continue
+    """Return the first selector that resolves in any content frame, else None."""
+    for frame in _content_frames(page):
+        for sel in selectors:
+            try:
+                el = frame.wait_for_selector(sel, timeout=timeout, state="visible")
+                if el:
+                    return el
+            except Exception:
+                continue
     return None
 
 
@@ -89,12 +100,13 @@ def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=3000):
 
 
 def _visible(page, selectors) -> bool:
-    for sel in selectors:
-        try:
-            if page.locator(sel).first.is_visible(timeout=1000):
-                return True
-        except Exception:
-            continue
+    for frame in _content_frames(page):
+        for sel in selectors:
+            try:
+                if frame.locator(sel).first.is_visible(timeout=1000):
+                    return True
+            except Exception:
+                continue
     return False
 
 
@@ -120,14 +132,17 @@ _shot.last_taken = 0
 
 
 def _participant_count(page):
-    for sel in SEL_PARTICIPANT_COUNT:
-        try:
-            txt = page.locator(sel).first.inner_text(timeout=1000).strip()
-            if txt.isdigit():
-                return int(txt)
-        except Exception:
-            continue
+    for frame in _content_frames(page):
+        for sel in SEL_PARTICIPANT_COUNT:
+            try:
+                txt = frame.locator(sel).first.inner_text(timeout=1000).strip()
+                if txt.isdigit():
+                    return int(txt)
+            except Exception:
+                continue
     return None
+
+
 
 
 def _ensure_audio():
@@ -219,8 +234,6 @@ def run(event_id: str) -> int:
             # Retry (not one-shot) -- the page can be slow to render on this
             # hardware, and a single timed check can miss an element that
             # shows up a few seconds later.
-            log.info("page title at name-check: %s", page.title())
-            log.info("page URL at name-check: %s", page.url)
             el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=45)
             if el:
                 el.fill(config.ZOOM_DISPLAY_NAME)
@@ -297,8 +310,8 @@ def run(event_id: str) -> int:
                 try:
                     leave.click()
                     page.wait_for_timeout(1_500)
-                    lb = page.locator("button:has-text('Leave Meeting')").first
-                    if lb.is_visible(timeout=2_000):
+                    lb = _first(page, ["button:has-text('Leave Meeting')"], timeout=2_000)
+                    if lb:
                         lb.click()
                 except Exception:
                     pass
