@@ -93,6 +93,7 @@ def main():
 
     last_poll = 0
     last_session_check = 0
+    consecutive_errors = 0
     while _running:
         try:
             if time.time() - last_poll > config.POLL_INTERVAL_MINUTES * 60:
@@ -103,9 +104,17 @@ def main():
                 last_session_check = time.time()
             launch_due()
             reap()
+            consecutive_errors = 0
         except Exception as e:
-            log.exception("loop error")
-            notify.push("zoombot error", str(e)[:300], priority="high")
+            consecutive_errors += 1
+            log.exception("loop error (%d in a row)", consecutive_errors)
+            # A single blip (Outlook hiccup, brief network drop) shouldn't
+            # page anyone -- the loop retries every 20s regardless. Only
+            # alert once failures are actually persisting.
+            if consecutive_errors >= 3:
+                notify.push("zoombot error",
+                            f"{e}"[:300] + f" ({consecutive_errors} in a row)",
+                            priority="high")
         time.sleep(20)
 
     for proc in _children.values():

@@ -271,6 +271,11 @@ def run(event_id: str) -> int:
 
             joined_at = dt.datetime.now(dt.timezone.utc)
             db.set_status(event_id, "in_meeting", joined_at=joined_at.isoformat())
+            if config.ZOOM_STATE.exists():
+                # Persist whatever cookies the server just issued -- Google/Zoom
+                # can rotate session tokens on use, and this snapshot only gets
+                # staler every time it's read without being written back.
+                ctx.storage_state(path=str(config.ZOOM_STATE))
             _shot(page, event_id, "joined")
             notify.push("Joined", f"{subject}", tags="white_check_mark")
             log.info("in meeting: %s", subject)

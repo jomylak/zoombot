@@ -51,6 +51,11 @@ def check() -> bool:
             page.goto(PROFILE_URL, timeout=30_000, wait_until="domcontentloaded")
             page.wait_for_timeout(3_000)
             signed_in = "signin" not in page.url and "login" not in page.url
+            if signed_in:
+                # Google/Zoom can rotate session tokens on use -- persist
+                # whatever cookies the server just handed back, or this
+                # snapshot only gets staler every time it's read.
+                ctx.storage_state(path=str(config.ZOOM_STATE))
         except Exception as e:
             log.warning("session check failed to load: %s", e)
         finally:
