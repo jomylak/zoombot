@@ -9,6 +9,7 @@ import sys
 import time
 import logging
 import datetime as dt
+import hashlib
 import shutil
 import subprocess
 
@@ -124,9 +125,17 @@ def _chromium_path():
     return None
 
 
+def _shot_id(event_id):
+    """Exchange global object IDs share a long common header across every
+    event on a calendar -- event_id[:24] was landing on that shared prefix,
+    so screenshots from completely different meetings looked identical by
+    filename. Hash the whole id instead for a short, actually-unique tag."""
+    return hashlib.sha1(event_id.encode()).hexdigest()[:10]
+
+
 def _shot(page, event_id, tag):
     try:
-        p = config.SHOTS_DIR / f"{event_id[:24]}_{tag}_{int(time.time())}.png"
+        p = config.SHOTS_DIR / f"{_shot_id(event_id)}_{tag}_{int(time.time())}.png"
         page.screenshot(path=str(p))
         _shot.last_taken = time.time()
         return p
@@ -139,7 +148,7 @@ _shot.last_taken = 0
 
 def _save_image(image, event_id, tag):
     try:
-        p = config.SHOTS_DIR / f"{event_id[:24]}_{tag}_{int(time.time())}.png"
+        p = config.SHOTS_DIR / f"{_shot_id(event_id)}_{tag}_{int(time.time())}.png"
         image.save(str(p))
         return p
     except Exception:
@@ -246,29 +255,42 @@ def run(event_id: str) -> int:
                 dismiss.click()
                 page.wait_for_timeout(1_000)
 
-            # Retry (not one-shot) -- the page can be slow to render on this
-            # hardware, and a single timed check can miss an element that
-            # shows up a few seconds later.
-            el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=45)
-            if el:
-                el.fill(config.ZOOM_DISPLAY_NAME)
+            # If the saved session belongs to the same Zoom account hosting
+            # this meeting (e.g. testing with your own account/meeting),
+            # Zoom skips the pre-join lobby entirely and drops straight into
+            # the meeting -- there's no name field or join button to find.
+            # Without this check, the broad "input[type='text']" fallback in
+            # SEL_NAME_INPUT can still match some unrelated in-meeting text
+            # box (search, chat) and "succeed", only to then hang looking
+            # for a join button that will never exist and fail loudly on an
+            # already-successful join.
+            if _visible(page, SEL_IN_MEETING):
+                log.info("landed directly in the meeting -- host session "
+                         "skipped the pre-join lobby")
             else:
-                _shot(page, event_id, "no_name_field")
-                raise RuntimeError(
-                    "name input never appeared -- page may be slow to load "
-                    "on this hardware, or the pre-join screen changed")
+                # Retry (not one-shot) -- the page can be slow to render on
+                # this hardware, and a single timed check can miss an
+                # element that shows up a few seconds later.
+                el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=45)
+                if el:
+                    el.fill(config.ZOOM_DISPLAY_NAME)
+                else:
+                    _shot(page, event_id, "no_name_field")
+                    raise RuntimeError(
+                        "name input never appeared -- page may be slow to load "
+                        "on this hardware, or the pre-join screen changed")
 
-            if rec["link_source"] != "registration":
-                pw_el = _retry_for_any(page, SEL_PASSCODE, timeout_s=10)
-                if pw_el and rec.get("passcode"):
-                    pw_el.fill(rec["passcode"])
+                if rec["link_source"] != "registration":
+                    pw_el = _retry_for_any(page, SEL_PASSCODE, timeout_s=10)
+                    if pw_el and rec.get("passcode"):
+                        pw_el.fill(rec["passcode"])
 
-            btn = _retry_for_any(page, SEL_JOIN_BTN, timeout_s=20)
-            if btn:
-                btn.click()
-            else:
-                _shot(page, event_id, "no_join_button")
-                raise RuntimeError("Join button never appeared or never became clickable")
+                btn = _retry_for_any(page, SEL_JOIN_BTN, timeout_s=20)
+                if btn:
+                    btn.click()
+                else:
+                    _shot(page, event_id, "no_join_button")
+                    raise RuntimeError("Join button never appeared or never became clickable")
 
             # Wait to actually land in the meeting -- may sit in a waiting room.
             join_deadline = time.time() + config.JOIN_TIMEOUT_MINUTES * 60
