@@ -6,7 +6,11 @@ echo ">> System packages"
 sudo apt update
 sudo apt install -y python3-venv python3-pip chromium chromium-common \
      pulseaudio pulseaudio-utils fonts-liberation libnss3 libatk-bridge2.0-0 \
-     libgtk-3-0 libasound2 sqlite3
+     libgtk-3-0 libasound2 sqlite3 tesseract-ocr
+# libzbar's package name depends on the OS's time_t transition state:
+# Debian 13/trixie (current Raspberry Pi OS) renamed it libzbar0t64; older
+# bookworm-based images still use libzbar0.
+sudo apt install -y libzbar0t64 || sudo apt install -y libzbar0
 
 echo ">> Virtualenv"
 python3 -m venv .venv

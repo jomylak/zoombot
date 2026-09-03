@@ -88,6 +88,18 @@ Dry-run a single meeting without waiting for the scheduler:
 sqlite3 ~/.zoombot/attendance.db 'select subject,status,joined_at,left_at,exit_reason from attendance'
 ```
 
+## Attendance-check (QR code) detection
+
+Some meetings show an on-screen QR code or a text prompt ("attendance",
+"scan code", ...) that only a human can act on. While in a meeting, the bot
+checks the screen every ~30s for a QR code (`pyzbar`) or a keyword match via
+OCR (`pytesseract`, keywords in `ATTENDANCE_KEYWORDS`). On a match it saves a
+screenshot to `~/.zoombot/screenshots/` and sends an ntfy push titled
+**"Attendance check necessary"** with the screenshot attached directly to the
+notification, so you can view it from your phone without any extra login.
+Repeat alerts for the same prompt are suppressed for `ATTENDANCE_ALERT_COOLDOWN_MINUTES`
+(default 10). Disable with `ATTENDANCE_CHECK_ENABLED=false`.
+
 ## When a join breaks
 
 Zoom rewrites its web client every few months and the DOM selectors go stale.

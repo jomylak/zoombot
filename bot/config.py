@@ -27,6 +27,12 @@ SESSION_CHECK_INTERVAL_HOURS = _int("SESSION_CHECK_INTERVAL_HOURS", 48)
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 
+ATTENDANCE_CHECK_ENABLED = os.getenv("ATTENDANCE_CHECK_ENABLED", "true").lower() == "true"
+ATTENDANCE_KEYWORDS = os.getenv(
+    "ATTENDANCE_KEYWORDS",
+    "attendance,qr code,scan code,scan the code,check-in,checkin")
+ATTENDANCE_ALERT_COOLDOWN_MINUTES = _int("ATTENDANCE_ALERT_COOLDOWN_MINUTES", 10)
+
 STATE_DIR = Path(os.path.expanduser(os.getenv("STATE_DIR", "~/.zoombot")))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 

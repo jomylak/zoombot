@@ -14,7 +14,7 @@ import subprocess
 
 from playwright.sync_api import sync_playwright
 
-from . import config, db, notify
+from . import attendance_watch, config, db, notify
 
 log = logging.getLogger("joiner")
 
@@ -129,6 +129,15 @@ def _shot(page, event_id, tag):
 
 
 _shot.last_taken = 0
+
+
+def _save_image(image, event_id, tag):
+    try:
+        p = config.SHOTS_DIR / f"{event_id[:24]}_{tag}_{int(time.time())}.png"
+        image.save(str(p))
+        return p
+    except Exception:
+        return None
 
 
 def _participant_count(page):
@@ -284,6 +293,7 @@ def run(event_id: str) -> int:
             low_streak = 0
             near_end_shot_taken = False
             NEAR_END_WINDOW = dt.timedelta(minutes=5)
+            last_attendance_alert = 0.0
 
             while dt.datetime.now(dt.timezone.utc) < deadline:
                 page.wait_for_timeout(30_000)
@@ -291,6 +301,25 @@ def run(event_id: str) -> int:
                 if not _visible(page, SEL_IN_MEETING):
                     exit_reason = "host_ended_or_dropped"
                     break
+
+                if config.ATTENDANCE_CHECK_ENABLED:
+                    cooldown_s = config.ATTENDANCE_ALERT_COOLDOWN_MINUTES * 60
+                    if time.time() - last_attendance_alert > cooldown_s:
+                        matched, reason, image = attendance_watch.check(page)
+                        if matched:
+                            last_attendance_alert = time.time()
+                            shot_path = _save_image(image, event_id, "attendance")
+                            log.info("attendance prompt detected (%s)", reason)
+                            if shot_path:
+                                notify.push_with_attachment(
+                                    "Attendance check necessary",
+                                    f"{subject} ({reason})",
+                                    shot_path, priority="urgent",
+                                    tags="qr_code,warning")
+                            else:
+                                notify.push("Attendance check necessary",
+                                           f"{subject} ({reason})",
+                                           priority="urgent", tags="qr_code,warning")
 
                 # One shot ~5 min before scheduled end, only while still
                 # genuinely in the meeting -- if it already ended, the
