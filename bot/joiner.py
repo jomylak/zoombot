@@ -47,6 +47,12 @@ SEL_WAITING_ROOM = [":text('Please wait')", ":text('waiting room')",
                     ":text('Host has joined')",
                     ":text('We've let them know')"]
 SEL_LEAVE_BTN = ["button:has-text('Leave')", ".footer__leave-btn"]
+# Unambiguous end-of-meeting states -- act on these immediately, no debounce
+# needed, unlike the footer-bar check below which can false-positive on a
+# transient re-render.
+SEL_MEETING_ENDED = [":text('This meeting has been ended by')",
+                     ":text('has ended')", ":text('Meeting ended')"]
+SEL_REMOVED = [":text('You have been removed')", ":text('removed by the host')"]
 SEL_LOGIN_WALL = ["input[type='password'][name='password']", ":text('Sign In to Join')"]
 SEL_PARTICIPANT_COUNT = [".footer-button__number-counter",
                          "[aria-label*='open the participants' i] span"]
@@ -291,6 +297,7 @@ def run(event_id: str) -> int:
 
             exit_reason = "scheduled_end"
             low_streak = 0
+            gone_streak = 0
             near_end_shot_taken = False
             NEAR_END_WINDOW = dt.timedelta(minutes=5)
             last_attendance_alert = 0.0
@@ -298,9 +305,26 @@ def run(event_id: str) -> int:
             while dt.datetime.now(dt.timezone.utc) < deadline:
                 page.wait_for_timeout(30_000)
 
-                if not _visible(page, SEL_IN_MEETING):
-                    exit_reason = "host_ended_or_dropped"
+                # Explicit end/removal screens are unambiguous -- act on the
+                # first sighting. The plain "footer bar gone" signal below
+                # isn't: it can also just mean the page is mid-re-render, so
+                # it needs a second consecutive miss before we trust it,
+                # same debounce style as the participant-count check.
+                if _visible(page, SEL_MEETING_ENDED):
+                    exit_reason = "host_ended_meeting"
                     break
+                if _visible(page, SEL_REMOVED):
+                    exit_reason = "removed_from_meeting"
+                    break
+
+                if not _visible(page, SEL_IN_MEETING):
+                    gone_streak += 1
+                    if gone_streak >= 2:  # ~60s sustained, not a blip
+                        exit_reason = "host_ended_or_dropped"
+                        break
+                    continue
+                else:
+                    gone_streak = 0
 
                 if config.ATTENDANCE_CHECK_ENABLED:
                     cooldown_s = config.ATTENDANCE_ALERT_COOLDOWN_MINUTES * 60
