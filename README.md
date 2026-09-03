@@ -8,7 +8,14 @@ Outlook (published ICS feed)  ->  filter by [AutoJoin] in the title  ->  extract
                                                                           |
                                           headless Chromium joins  ->  SQLite log + ntfy push
 ```
+Check schedule: sqlite3 -header -column ~/.zoombot/attendance.db \
+'SELECT scheduled_start, subject, status
+ FROM attendance
+ ORDER BY scheduled_start;'
 
+ check uptime:
+ systemctl --user status zoombot
+ 
 ## 1. Publish your calendar (2 min, one time)
 
 1. In Outlook on the web: **Settings** -> **Calendar** -> **Shared calendars**.
