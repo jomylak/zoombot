@@ -1,9 +1,17 @@
-"""Joins one Zoom meeting, sits in it, leaves, records the result.
+"""Joins one meeting (Zoom, Teams, Meet, Webex, or anything else with a
+guest-joinable web link), sits in it, leaves, records the result.
 
 Run as a subprocess (one per meeting) so a crash or a memory leak can never
 take down the scheduler:
 
     python -m bot.joiner <event_id>
+
+Selectors for each step are resolved per (platform, url-shape) "variant":
+learned selectors from past successful joins first, then any hand-written
+baseline (currently just Zoom), and only when both come up empty does this
+fall back to the AI agent (bot/ai_agent.py) -- which also records whatever
+it finds, so future joins of the same shape of meeting need it less and
+less. See bot/selector_store.py and bot/platforms.py for that machinery.
 """
 import sys
 import time
@@ -12,10 +20,12 @@ import datetime as dt
 import hashlib
 import shutil
 import subprocess
+import fcntl
 
 from playwright.sync_api import sync_playwright
 
-from . import attendance_watch, config, db, notify
+from . import ai_agent, attendance_watch, config, db, notify, platforms, selector_store
+from .browser_util import first
 
 log = logging.getLogger("joiner")
 
@@ -28,101 +38,20 @@ CHROMIUM_ARGS = [
     "--no-sandbox",
 ]
 
-# Zoom rewrites its web client fairly often. Each of these is a list of
-# candidates tried in order -- when a join breaks, this is the first place
-# to look. Grab a screenshot from ~/.zoombot/screenshots to see what changed.
-SEL_NAME_INPUT = ["#input-for-name", "input[placeholder*='name' i]", "#inputname",
-                  "input[type='text']"]
-SEL_PASSCODE = ["#input-for-pwd", "input[type='password']",
-                "input[aria-label*='passcode' i]", "input[aria-label*='password' i]"]
-SEL_JOIN_BTN = ["button:has-text('Join')", "#joinBtn", ".preview-join-button",
-               "text=Join"]
-SEL_JOIN_FROM_BROWSER = ["button:has-text('Join from browser')",
-                         ":text('Join from browser')"]
-SEL_CONTINUE_WITHOUT_MEDIA = ["button:has-text('Continue without microphone and camera')",
-                              "button:has-text('Continue without')"]
-SEL_IN_MEETING = ["#foot-bar", ".footer-participants-button",
-                  "[aria-label*='open the participants' i]", ".meeting-info-icon"]
-SEL_WAITING_ROOM = [":text('Please wait')", ":text('waiting room')",
-                    ":text('host will let you in')",
-                    ":text('Host has joined')",
-                    ":text('We've let them know')"]
-SEL_LEAVE_BTN = ["button:has-text('Leave')", ".footer__leave-btn"]
-# Unambiguous end-of-meeting states -- act on these immediately, no debounce
-# needed, unlike the footer-bar check below which can false-positive on a
-# transient re-render.
-SEL_MEETING_ENDED = [":text('This meeting has been ended by')",
-                     ":text('has ended')", ":text('Meeting ended')"]
-SEL_REMOVED = [":text('You have been removed')", ":text('removed by the host')"]
-SEL_LOGIN_WALL = ["input[type='password'][name='password']", ":text('Sign In to Join')"]
-SEL_PARTICIPANT_COUNT = [".footer-button__number-counter",
-                         "[aria-label*='open the participants' i] span"]
 
-
-def _content_frames(page):
-    """The pre-join and in-meeting UI render inside a nested iframe whose URL
-    carries per-session join tokens (wpk=, _x_zm_rtaid=, ...) -- never the
-    top-level document. page.locator()/wait_for_selector() only search the
-    main frame, so every lookup has to walk all frames instead. Skip
-    reCAPTCHA and blank placeholder frames; they never hold anything we want
-    and just slow every check down."""
-    return [f for f in page.frames if "recaptcha" not in f.url and f.url != "about:blank"]
-
-
-def _first(page, selectors, timeout=3000):
-    """Return the first selector that resolves in any content frame, else None."""
-    for frame in _content_frames(page):
-        for sel in selectors:
-            try:
-                el = frame.wait_for_selector(sel, timeout=timeout, state="visible")
-                if el:
-                    return el
-            except Exception:
-                continue
-    return None
-
-
-def _retry_for_any(page, selectors, timeout_s, poll_s=3, per_try_timeout=3000):
-    """Keep re-scanning the whole selector list every few seconds until one
-    resolves or timeout_s elapses -- a single _first() pass gives up for good
-    once it's cycled through the list, even if the field just hadn't rendered
-    yet. Also rides through transient errors (mid re-render, brief overlay)
-    that would otherwise abort a one-shot wait_for_selector call."""
-    deadline = time.time() + timeout_s
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            el = _first(page, selectors, timeout=per_try_timeout)
-        except Exception as e:
-            log.info("retry attempt %d: transient error %s", attempt, e)
-            el = None
-        if el:
-            return el
-        if time.time() >= deadline:
-            return None
-        log.info("retry attempt %d: none of %s found yet, retrying in %ds",
-                 attempt, selectors, poll_s)
-        page.wait_for_timeout(poll_s * 1000)
-
-
-def _visible(page, selectors) -> bool:
-    for frame in _content_frames(page):
-        for sel in selectors:
-            try:
-                if frame.locator(sel).first.is_visible(timeout=1000):
-                    return True
-            except Exception:
-                continue
-    return False
-
-
-def _chromium_path():
-    for name in ("chromium", "chromium-browser"):
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
+def _resolve(page, variant_key, role, event_id, rec, timeout_s=3, retry=False, required=False):
+    """Selector-store lookup, falling back to a single agent call when
+    nothing known works. Returns an element or None (raises if required and
+    still not found)."""
+    el = selector_store.resolve(page, variant_key, role, timeout_s=timeout_s, retry=retry)
+    if not el and config.AGENT_ENABLED:
+        log.info("no known selector for %s/%s, asking the agent", variant_key, role)
+        el = ai_agent.find_role(page, variant_key, role, rec)
+    if not el and required:
+        _shot(page, event_id, f"no_{role}")
+        raise RuntimeError(f"couldn't find an element for role {role!r} "
+                           f"(variant {variant_key!r})")
+    return el
 
 
 def _shot_id(event_id):
@@ -155,18 +84,23 @@ def _save_image(image, event_id, tag):
         return None
 
 
-def _participant_count(page):
-    for frame in _content_frames(page):
-        for sel in SEL_PARTICIPANT_COUNT:
-            try:
-                txt = frame.locator(sel).first.inner_text(timeout=1000).strip()
-                if txt.isdigit():
-                    return int(txt)
-            except Exception:
-                continue
+def _chromium_path():
+    for name in ("chromium", "chromium-browser"):
+        path = shutil.which(name)
+        if path:
+            return path
     return None
 
 
+def _participant_count(page, variant_key, event_id, rec):
+    el = _resolve(page, variant_key, "participant_count", event_id, rec, timeout_s=1)
+    if not el:
+        return None
+    try:
+        txt = el.inner_text(timeout=1000).strip()
+        return int(txt) if txt.isdigit() else None
+    except Exception:
+        return None
 
 
 def _ensure_audio():
@@ -198,6 +132,48 @@ def _ensure_audio():
         log.warning("audio sink check failed (continuing anyway): %s", e)
 
 
+def _acquire_browser_lock():
+    """Cooperative lock shared with the Pi's other Chromium user (ApplyPilot's
+    pi_enrich_runner.py, which takes it non-blocking and skips its turn when
+    this holds it). This side takes it BLOCKING -- joining on time matters
+    more than a clean handoff -- but first touches BROWSER_YIELD_PATH so the
+    enrichment side, mid-batch, notices and bails out of its current batch
+    early instead of making us wait for the whole thing. Returns the open
+    file handle; release with _release_browser_lock."""
+    config.BROWSER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        config.BROWSER_YIELD_PATH.touch()
+    except Exception:
+        pass
+    fh = open(config.BROWSER_LOCK_PATH, "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    try:
+        config.BROWSER_YIELD_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return fh
+
+
+def _release_browser_lock(fh):
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def _needs_manual_login(page, event_id, rec, variant_key, platform, why: str) -> int:
+    _shot(page, event_id, "needs_login")
+    db.set_status(event_id, "needs_manual_login", error=why)
+    selector_store.mark_needs_login(variant_key, platform, rec.get("join_url") or "")
+    notify.push("Needs your login",
+               f"{rec['subject']} -- {why}. This meeting requires signing in "
+               "with your personal account; the bot won't attempt that. "
+               "Join it yourself if you want to attend.",
+               priority="high", tags="lock")
+    log.warning("needs manual login: %s (%s)", rec["subject"], why)
+    return 0  # handled outcome, not a crash
+
+
 def run(event_id: str) -> int:
     rec = db.get(event_id)
     if not rec:
@@ -208,17 +184,31 @@ def run(event_id: str) -> int:
 
     subject = rec["subject"]
     url = rec["join_url"]
+    platform = rec.get("platform") or platforms.detect_platform(url)
+    variant_key = platforms.variant_key(url)
     end_at = dt.datetime.fromisoformat(rec["scheduled_end"])
     hard_stop = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=config.MAX_SESSION_MINUTES)
     deadline = min(end_at, hard_stop)
 
     db.set_status(event_id, "joining")
+    db.touch_variant(variant_key, platform, url)
 
+    state_path = config.platform_state_path(platform)
+
+    lock_fh = _acquire_browser_lock()
+    try:
+        return _join_and_attend(event_id, rec, subject, url, platform, variant_key,
+                                 deadline, state_path)
+    finally:
+        _release_browser_lock(lock_fh)
+
+
+def _join_and_attend(event_id, rec, subject, url, platform, variant_key, deadline, state_path):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=CHROMIUM_ARGS,
                                     executable_path=_chromium_path())
         ctx = browser.new_context(
-            storage_state=str(config.ZOOM_STATE) if config.ZOOM_STATE.exists() else None,
+            storage_state=str(state_path) if state_path.exists() else None,
             viewport={"width": 1024, "height": 700},  # small = cheaper on a Pi 4
             permissions=["microphone", "camera"],
         )
@@ -226,93 +216,92 @@ def run(event_id: str) -> int:
         page.on("console", lambda msg: log.info("browser console: %s", msg.text))
         page.on("pageerror", lambda exc: log.error("browser page error: %s", exc))
         try:
-            log.info("navigating: %s", url)
+            log.info("navigating: %s (%s)", url, platform)
             page.goto(url, timeout=90_000, wait_until="domcontentloaded")
             page.wait_for_timeout(5_000)
 
-            if _visible(page, SEL_LOGIN_WALL):
-                _shot(page, event_id, "loginwall")
-                raise RuntimeError(
-                    "Zoom is asking us to sign in -- saved session expired. "
-                    "Re-run: python -m bot.zoom_login")
+            if platforms.is_idp_login_host(page.url) or selector_store.is_visible(
+                    page, variant_key, "login_wall"):
+                return _needs_manual_login(page, event_id, rec, variant_key, platform,
+                                           "saved session expired or account sign-in required")
 
-            # Registration links land on an intermediate "which app" chooser
-            # before the actual join screen -- direct /wc/ links skip this.
-            chooser = _first(page, SEL_JOIN_FROM_BROWSER, timeout=5_000)
-            if chooser:
-                log.info("hit the app-vs-browser chooser, clicking 'Join from browser'")
-                chooser.click()
-                page.wait_for_timeout(2_000)
-
-            # Zoom sometimes shows up to two device-permission prompts
-            # ("see you" then "hear you") before the name field is usable.
-            # Dismiss without granting -- the bot doesn't need mic/camera.
-            for _ in range(2):
-                dismiss = _first(page, SEL_CONTINUE_WITHOUT_MEDIA, timeout=3_000)
-                if not dismiss:
-                    break
-                log.info("dismissing a device-permission prompt")
-                dismiss.click()
-                page.wait_for_timeout(1_000)
-
-            # If the saved session belongs to the same Zoom account hosting
-            # this meeting (e.g. testing with your own account/meeting),
-            # Zoom skips the pre-join lobby entirely and drops straight into
-            # the meeting -- there's no name field or join button to find.
-            # Without this check, the broad "input[type='text']" fallback in
-            # SEL_NAME_INPUT can still match some unrelated in-meeting text
-            # box (search, chat) and "succeed", only to then hang looking
-            # for a join button that will never exist and fail loudly on an
-            # already-successful join.
-            if _visible(page, SEL_IN_MEETING):
-                log.info("landed directly in the meeting -- host session "
-                         "skipped the pre-join lobby")
+            if selector_store.is_new_variant(variant_key):
+                log.info("brand-new variant %s -- handing the whole pre-join "
+                         "sequence to the agent", variant_key)
+                outcome = ai_agent.drive(page, variant_key, rec)
+                if outcome == "needs_login":
+                    return _needs_manual_login(page, event_id, rec, variant_key, platform,
+                                               "no guest join path found")
+                if outcome != "in_meeting":
+                    _shot(page, event_id, "agent_stuck")
+                    raise RuntimeError(f"agent couldn't get into the meeting (outcome={outcome})")
             else:
-                # Retry (not one-shot) -- the page can be slow to render on
-                # this hardware, and a single timed check can miss an
-                # element that shows up a few seconds later.
-                el = _retry_for_any(page, SEL_NAME_INPUT, timeout_s=45)
-                if el:
-                    el.fill(config.ZOOM_DISPLAY_NAME)
+                # Registration links land on an intermediate "which app"
+                # chooser before the actual join screen -- direct links skip it.
+                chooser = _resolve(page, variant_key, "join_from_browser", event_id, rec, timeout_s=5)
+                if chooser:
+                    log.info("hit the app-vs-browser chooser, clicking 'Join from browser'")
+                    chooser.click()
+                    page.wait_for_timeout(2_000)
+
+                # Some clients show up to two device-permission prompts before
+                # the name field is usable. Dismiss without granting -- the
+                # bot doesn't need mic/camera.
+                for _ in range(2):
+                    dismiss = _resolve(page, variant_key, "dismiss_media_prompt", event_id, rec, timeout_s=3)
+                    if not dismiss:
+                        break
+                    log.info("dismissing a device-permission prompt")
+                    dismiss.click()
+                    page.wait_for_timeout(1_000)
+
+                # If the saved session belongs to the same account hosting
+                # this meeting (e.g. testing with your own account/meeting),
+                # the host session skips the pre-join lobby entirely and
+                # drops straight into the meeting -- no name field or join
+                # button to find.
+                if selector_store.is_visible(page, variant_key, "in_meeting"):
+                    log.info("landed directly in the meeting -- host session "
+                             "skipped the pre-join lobby")
                 else:
-                    _shot(page, event_id, "no_name_field")
-                    raise RuntimeError(
-                        "name input never appeared -- page may be slow to load "
-                        "on this hardware, or the pre-join screen changed")
+                    el = _resolve(page, variant_key, "name_input", event_id, rec,
+                                 timeout_s=45, retry=True, required=True)
+                    el.fill(config.DISPLAY_NAME)
 
-                if rec["link_source"] != "registration":
-                    pw_el = _retry_for_any(page, SEL_PASSCODE, timeout_s=10)
-                    if pw_el and rec.get("passcode"):
-                        pw_el.fill(rec["passcode"])
+                    if rec["link_source"] != "registration":
+                        pw_el = _resolve(page, variant_key, "passcode_input", event_id, rec,
+                                        timeout_s=10, retry=True)
+                        if pw_el and rec.get("passcode"):
+                            pw_el.fill(rec["passcode"])
 
-                btn = _retry_for_any(page, SEL_JOIN_BTN, timeout_s=20)
-                if btn:
+                    btn = _resolve(page, variant_key, "join_button", event_id, rec,
+                                   timeout_s=20, retry=True, required=True)
                     btn.click()
-                else:
-                    _shot(page, event_id, "no_join_button")
-                    raise RuntimeError("Join button never appeared or never became clickable")
 
-            # Wait to actually land in the meeting -- may sit in a waiting room.
-            join_deadline = time.time() + config.JOIN_TIMEOUT_MINUTES * 60
-            while time.time() < join_deadline:
-                if _visible(page, SEL_IN_MEETING):
-                    break
-                if _visible(page, SEL_WAITING_ROOM):
-                    log.info("in waiting room, holding...")
-                page.wait_for_timeout(5_000)
-            else:
-                _shot(page, event_id, "jointimeout")
-                raise RuntimeError(
-                    f"never got in within {config.JOIN_TIMEOUT_MINUTES}m "
-                    "(waiting room never opened?)")
+                # Wait to actually land in the meeting -- may sit in a waiting room.
+                join_deadline = time.time() + config.JOIN_TIMEOUT_MINUTES * 60
+                while time.time() < join_deadline:
+                    if selector_store.is_visible(page, variant_key, "in_meeting"):
+                        break
+                    if selector_store.is_visible(page, variant_key, "waiting_room"):
+                        log.info("in waiting room, holding...")
+                    page.wait_for_timeout(5_000)
+                else:
+                    _shot(page, event_id, "jointimeout")
+                    raise RuntimeError(
+                        f"never got in within {config.JOIN_TIMEOUT_MINUTES}m "
+                        "(waiting room never opened?)")
 
             joined_at = dt.datetime.now(dt.timezone.utc)
             db.set_status(event_id, "in_meeting", joined_at=joined_at.isoformat())
-            if config.ZOOM_STATE.exists():
-                # Persist whatever cookies the server just issued -- Google/Zoom
-                # can rotate session tokens on use, and this snapshot only gets
-                # staler every time it's read without being written back.
-                ctx.storage_state(path=str(config.ZOOM_STATE))
+            selector_store.mark_ok(variant_key, platform, url)
+            # Persist whatever cookies the server just issued -- sessions
+            # can rotate tokens on use, and this snapshot only gets staler
+            # every time it's read without being written back.
+            try:
+                ctx.storage_state(path=str(state_path))
+            except Exception:
+                pass
             _shot(page, event_id, "joined")
             notify.push("Joined", f"{subject}", tags="white_check_mark")
             log.info("in meeting: %s", subject)
@@ -332,14 +321,14 @@ def run(event_id: str) -> int:
                 # isn't: it can also just mean the page is mid-re-render, so
                 # it needs a second consecutive miss before we trust it,
                 # same debounce style as the participant-count check.
-                if _visible(page, SEL_MEETING_ENDED):
+                if selector_store.is_visible(page, variant_key, "meeting_ended"):
                     exit_reason = "host_ended_meeting"
                     break
-                if _visible(page, SEL_REMOVED):
+                if selector_store.is_visible(page, variant_key, "removed"):
                     exit_reason = "removed_from_meeting"
                     break
 
-                if not _visible(page, SEL_IN_MEETING):
+                if not selector_store.is_visible(page, variant_key, "in_meeting"):
                     gone_streak += 1
                     if gone_streak >= 2:  # ~60s sustained, not a blip
                         exit_reason = "host_ended_or_dropped"
@@ -376,7 +365,7 @@ def run(event_id: str) -> int:
                     near_end_shot_taken = True
                     log.info("near-end screenshot taken for %s", subject)
 
-                n = _participant_count(page)
+                n = _participant_count(page, variant_key, event_id, rec)
                 if n is not None and n < config.MIN_PARTICIPANTS:
                     low_streak += 1
                     if low_streak >= 3:  # ~90s sustained, not a blip
@@ -385,12 +374,12 @@ def run(event_id: str) -> int:
                 else:
                     low_streak = 0
 
-            leave = _first(page, SEL_LEAVE_BTN, timeout=3_000)
+            leave = _resolve(page, variant_key, "leave_button", event_id, rec, timeout_s=3)
             if leave:
                 try:
                     leave.click()
                     page.wait_for_timeout(1_500)
-                    lb = _first(page, ["button:has-text('Leave Meeting')"], timeout=2_000)
+                    lb = first(page, ["button:has-text('Leave Meeting')"], timeout=2_000)
                     if lb:
                         lb.click()
                 except Exception:
@@ -406,8 +395,7 @@ def run(event_id: str) -> int:
 
         except Exception as e:
             log.exception("join failed")
-            # A specific failure point above (loginwall / no_name_field /
-            # no_join_button / jointimeout) already grabbed its own shot --
+            # A specific failure point above already grabbed its own shot --
             # don't also fire this generic one for the same failure.
             if time.time() - _shot.last_taken > 5:
                 _shot(page, event_id, "error")

@@ -31,24 +31,29 @@ def poll():
         parsed = extract.parse_event(ev.get("subject", ""), ev.get("body", ""), "")
 
         if not parsed:
-            log.warning("no Zoom details in %r -- skipping", ev.get("subject"))
+            # Don't alert now -- LOOKAHEAD_MINUTES can be weeks, and a "no
+            # link" alert that far out is easy to forget by the time it
+            # actually matters. Stays 'scheduled' so launch_due() raises the
+            # same JOIN FAILED alert a real join failure would, right at
+            # the moment it would have joined -- that's the useful time to
+            # tell someone to join manually.
+            log.warning("no meeting link in %r yet -- will alert at join time", ev.get("subject"))
             db.upsert_scheduled({
                 "event_id": eid, "subject": ev.get("subject"),
                 "organizer": ev.get("organizer"),
                 "scheduled_start": ev["start"].isoformat(), "scheduled_end": ev["end"].isoformat(),
-                "join_url": None, "passcode": None, "link_source": "none"})
-            db.set_status(eid, "skipped", error="no zoom link found")
-            notify.push("No Zoom link", ev.get("subject", ""), priority="high")
+                "join_url": None, "passcode": None, "link_source": "none", "platform": None})
             continue
 
-        url = extract.web_client_url(parsed["meeting_id"], parsed["passcode"], parsed["join_url"])
+        url = extract.resolve_join_url(parsed)
 
         db.upsert_scheduled({
             "event_id": eid, "subject": ev.get("subject"),
             "organizer": ev.get("organizer"),
             "scheduled_start": ev["start"].isoformat(), "scheduled_end": ev["end"].isoformat(),
-            "join_url": url, "passcode": parsed["passcode"], "link_source": "calendar"})
-        log.info("queued %r", ev.get("subject"))
+            "join_url": url, "passcode": parsed["passcode"], "link_source": "calendar",
+            "platform": parsed["platform"]})
+        log.info("queued %r (%s)", ev.get("subject"), parsed["platform"])
 
 
 def launch_due():
@@ -62,6 +67,12 @@ def launch_due():
             db.set_status(rec["event_id"], "skipped", error="missed (start already passed)")
             continue
         if now < start - dt.timedelta(minutes=config.JOIN_LEAD_MINUTES):
+            continue
+        if not rec.get("join_url"):
+            db.set_status(rec["event_id"], "failed", error="no meeting link found in invite")
+            notify.push("JOIN FAILED", f"{rec['subject']} -- no meeting link found, join manually",
+                        priority="high", tags="rotating_light")
+            log.warning("no meeting link at join time: %r", rec["subject"])
             continue
         log.info("launching joiner for %r", rec["subject"])
         notify.push("Launching", rec["subject"])
