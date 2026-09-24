@@ -107,12 +107,14 @@ def main():
     consecutive_errors = 0
     while _running:
         try:
+            # Stamp the time *before* running so a task that keeps failing
+            # retries at its normal interval, not every 20s loop.
             if time.time() - last_poll > config.POLL_INTERVAL_MINUTES * 60:
-                poll()
                 last_poll = time.time()
+                poll()
             if time.time() - last_session_check > config.SESSION_CHECK_INTERVAL_HOURS * 3600:
-                check_session.check()
                 last_session_check = time.time()
+                check_session.check()
             launch_due()
             reap()
             consecutive_errors = 0
@@ -122,7 +124,7 @@ def main():
             # A single blip (Outlook hiccup, brief network drop) shouldn't
             # page anyone -- the loop retries every 20s regardless. Only
             # alert once failures are actually persisting.
-            if consecutive_errors >= 3:
+            if consecutive_errors == 3:  # once per streak, not every loop
                 notify.push("zoombot error",
                             f"{e}"[:300] + f" ({consecutive_errors} in a row)",
                             priority="high")
